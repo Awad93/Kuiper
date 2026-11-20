@@ -5,6 +5,7 @@ import subprocess
 import yaml 
 import re 
 import uuid
+import time
 
 import inspect
 
@@ -20,8 +21,9 @@ from datetime import datetime
 y = yaml.load( open( 'configuration.yaml' , 'r' ) , Loader=yaml.FullLoader )
 
 
-reload(sys)
-sys.setdefaultencoding('utf8')
+if sys.version_info[0] == 2:
+    reload(sys)
+    sys.setdefaultencoding('utf8')
 
 
 
@@ -86,7 +88,9 @@ class ES_DB:
     def __init__(self, es_ip , es_port):
         self.es_ip = es_ip
         self.es_port = es_port
-        self.es_db = Elasticsearch('http://'+self.es_ip+':' + self.es_port , timeout=120)
+        endpoint = 'http://' + self.es_ip + ':' + self.es_port
+        self.es_db = Elasticsearch(endpoint, timeout=120)
+        self.bulk_db = Elasticsearch(endpoint, timeout=self.bulk_request_timeout, max_retries=0)
         #print inspect.getargspec(self.es_db.indices.put_settings())
         # setting 
 
@@ -225,7 +229,7 @@ class ES_DB:
                     else:
                         shard_reason = shard['reason']['reason']
 
-                    print shard_reason 
+                    print(shard_reason)
 
                     # if the reason is that the field used for key is text and is not sortable, then try it sub-field ".keyword" 
                     if shard_reason.startswith("Text fields are not optimised for operations that require per-document field data like aggregations and sorting, so these operations are disabled by default"):
@@ -302,7 +306,7 @@ class ES_DB:
             logger.logger(level=logger.ERROR , type="elasticsearch", message="Query ["+indexname+"] failed [ElasticsearchException]" , reason=json.dumps(e.info))
             res = [False, reason]
         except Exception as e:
-            print str(e)
+            print(str(e))
             res = [False, str(e)] 
             logger.logger(level=logger.ERROR , type="elasticsearch", message="Query ["+indexname+"] failed [Exception]" , reason=str(e))
 
@@ -318,7 +322,7 @@ class ES_DB:
             search_res = self.es_db.scroll(scroll_id=scroll_id , scroll=scroll)
             return [True, search_res]
         except Exception as e:
-            print str(e)
+            print(str(e))
             res = [False, str(e)] 
             logger.logger(level=logger.ERROR , type="elasticsearch", message="Scroll Query ID ["+scroll_id+"] failed [Exception]" , reason=str(e))
 
@@ -346,100 +350,100 @@ class ES_DB:
     #     "machine":...  (optional)
     # }
     
-    def bulk_queue_push(self, data , case_id , chunk_size=500):
+    def bulk_queue_push(self, data, case_id, chunk_size=500, record_ids=None):
         case_id = case_id.lower()
-        bulk_queue = []
+        actions = []
+        for position, record in enumerate(data):
+            source = {'Data': record['Data']}
+            for field in ('data_source', 'data_type', 'data_path', 'machine'):
+                if record.get(field) is not None:
+                    source[field] = record[field]
+            action = {'_index': case_id, '_source': source, '_id': str(uuid.uuid4())}
+            if record_ids is not None:
+                action['_id'] = record_ids[position]
+                action['_op_type'] = 'create'
+            actions.append(action)
 
-        for d in data:
-            di = {
-                "_index": case_id,
-                "_source": {},
-                '_id' : str(uuid.uuid4())
-            }
-            di['_source']['Data'] = d['Data']
-            if 'data_source' in d and d['data_source'] is not None:
-                di['_source']['data_source'] = d['data_source']
-            if 'data_type' in d and d['data_type'] is not None:
-                di['_source']['data_type'] = d['data_type']
-            if 'data_type' in d and d['data_type'] is not None:
-                di['_source']['data_type'] = d['data_type']
-            if 'data_path' in d and d['data_path'] is not None:
-                di['_source']['data_path'] = d['data_path']
-            if 'machine' in d and d['machine'] is not None:
-                di['_source']['machine'] = d['machine']
-                
-            bulk_queue.append(di)
-        
-        
-        logger.logger(level=logger.DEBUG , type="elasticsearch", message="Index ["+case_id+"]: Pushing ["+str(len(bulk_queue))+"] records")
+        return self.bulk_to_elasticsearch(actions, case_id, chunk_size)
 
-        push_es = self.bulk_to_elasticsearch( bulk_queue , case_id , chunk_size )
-        if push_es[0]:
-            logger.logger(level=logger.INFO , type="elasticsearch", message="Index ["+case_id+"]: Pushed ["+str(len(bulk_queue) - len(push_es[2]))+"] records successfully")
-            return [ True , "Pushed ["+str(len(bulk_queue))+"] records" , push_es[2] , push_es[3]]
-        else:
-            logger.logger(level=logger.ERROR , type="elasticsearch", message="Index ["+case_id+"]: Failed pusheing ["+str(len(bulk_queue))+"] records" , reason=push_es[1])
-            return [ False, 'Failed to bulk data to Elasticsearch: ' + str(push_es[1]) , bulk_queue , push_es[3]]
-            
+    bulk_retry_delays = (1, 2, 4)
+    bulk_request_timeout = 15
+    bulk_retry_statuses = (408, 429, 500, 502, 503, 504)
 
+    def send_bulk_actions(self, actions, chunk_size):
+        pending = {action['_id']: action for action in actions}
+        succeeded = []
+        rejected = {}
+        retry_reason = "unconfirmed bulk response"
+        for attempt in range(len(self.bulk_retry_delays) + 1):
+            try:
+                for ok, item in helpers.streaming_bulk(
+                    self.bulk_db, list(pending.values()), chunk_size=chunk_size,
+                    raise_on_error=False, raise_on_exception=True,
+                    request_timeout=self.bulk_request_timeout,
+                ):
+                    operation, result = next(iter(item.items()))
+                    record_id = result['_id']
+                    status = result.get('status')
+                    if ok or (operation == 'create' and status == 409):
+                        succeeded.append(record_id)
+                        del pending[record_id]
+                    elif status not in self.bulk_retry_statuses:
+                        rejected[record_id] = (pending.pop(record_id), result)
+                    else:
+                        retry_reason = "HTTP %s" % status
+            except elasticsearch.exceptions.TransportError as exc:
+                if not isinstance(exc, elasticsearch.exceptions.ConnectionError) and (
+                    exc.status_code not in self.bulk_retry_statuses
+                ):
+                    return succeeded, rejected, pending, str(exc)
+                retry_reason = type(exc).__name__
+            except Exception as exc:
+                return succeeded, rejected, pending, str(exc)
 
-    # ================================ push records to elasticsearch
-    # return list of records ids successed or failed
-    def bulk_to_elasticsearch(self,  bulk_queue, indx , chunk_size):    
-        
-        try:
-            errors = {} # contain dictionary of failed data (origin data and error info)
-            failed = [] # contain the IDs of the failed records
-            successed = [] # contain the IDs of successed records
+            if not pending:
+                return succeeded, rejected, pending, None
+            if attempt < len(self.bulk_retry_delays):
+                time.sleep(self.bulk_retry_delays[attempt])
 
-            logger.logger(level=logger.DEBUG , type="elasticsearch", message="Index ["+indx+"]: bulk push to ES, default chunk["+str(chunk_size)+"]: " , reason="number of records: " + str(len(bulk_queue)))
-            # use helpers to push the data to elasticsearch
-            for ok, item in helpers.parallel_bulk(self.es_db, bulk_queue, chunk_size=chunk_size,raise_on_error=False, raise_on_exception=False):
-                if not ok:
-                    errors[item['index']['_id']] = item
-                    logger.logger(level=logger.WARNING , type="elasticsearch", message="Index ["+indx+"]: Failed pushing record: " , reason=str(item))
-                    failed.append(item['index']['_id']) 
+        return succeeded, rejected, pending, "Elasticsearch bulk retry limit reached (%s)" % retry_reason
+
+    def bulk_to_elasticsearch(self, bulk_queue, indx, chunk_size):
+        # The first result indicates whether transport completed. Item failures
+        # remain separate so callers can finish later batches after a rejection.
+        succeeded, rejected, pending, error = self.send_bulk_actions(bulk_queue, chunk_size)
+        failed = list(pending.values())
+        if rejected:
+            fixable = {}
+            for record_id, (action, result) in rejected.items():
+                if result.get('status') == 400 and isinstance(result.get('error'), dict):
+                    fixable[record_id] = {'index': dict(result, data=action['_source'])}
                 else:
-                    successed.append(item['index']['_id'])
+                    failed.append(action)
+
+            if fixable and error is None:
+                repaired, unrepaired = self.bulk_to_elasticsearch_fix_errors(indx, fixable)
+                failed.extend(unrepaired)
+                for action in repaired:
+                    original = rejected[action['_id']][0]
+                    if '_op_type' in original:
+                        action['_op_type'] = original['_op_type']
+                if repaired:
+                    repaired_ids, rejected_again, pending, error = self.send_bulk_actions(repaired, chunk_size)
+                    succeeded.extend(repaired_ids)
+                    failed.extend(action for action, result in rejected_again.values())
+                    failed.extend(pending.values())
+            else:
+                failed.extend(rejected[record_id][0] for record_id in fixable)
+
+        message = "Indexed %s records in [%s], %s failed" % (len(succeeded), indx, len(failed))
+        if error:
+            message += ": " + error
+        if failed:
+            logger.logger(level=logger.ERROR, type="elasticsearch", message=message)
+        return [error is None, message, failed, succeeded]
 
 
-            if len(failed):
-                logger.logger(level=logger.WARNING , type="elasticsearch", message="Index ["+indx+"]: Failed pushing ["+str(len(failed))+"] records, try to fix the issue")
-                # get origin data from ID
-                for data in bulk_queue:
-                    try:
-                        errors[data['_id']]['index']['data'] = data['_source']   
-                        logger.logger(level=logger.DEBUG , type="elasticsearch", message="Index ["+indx+"]: get data for failed record ["+data['_id']+"]", reason=str(errors[data['_id']]))
-                    except:
-                        # if record not in the errors list, continue
-                        continue
-                    logger.logger(level=logger.WARNING , type="elasticsearch", message="Index ["+indx+"]: Failed pushing record: " , reason=str(data['_id']))
-
-                fixed_errors,nonfixed_errors = self.bulk_to_elasticsearch_fix_errors(indx , errors)
-                failed = nonfixed_errors
-                if len(fixed_errors):
-                    logger.logger(level=logger.DEBUG , type="elasticsearch", message="Index ["+indx+"]: fixed issue of ["+str(len(fixed_errors))+"] records, retry to push it")
-                    repush_failed_errors = self.bulk_to_elasticsearch(fixed_errors , indx , chunk_size)
-                    if repush_failed_errors[0]:
-                        successed += repush_failed_errors[3]
-                        failed += repush_failed_errors[2]
-                    
-
-            return [True , "Pushed ["+str(len(successed))+"] records to ["+indx+"] index" , failed , successed]
-
-
-        # if connection timeout to elasticsearch occurred
-        except elasticsearch.exceptions.ConnectionTimeout as e:
-            logger.logger(level=logger.WARNING , type="elasticsearch", message="Index ["+indx+"]: Failed to push the records, retry again" , reason="Connection to Elasticsearch timeout")
-            return self.bulk_to_elasticsearch( bulk_queue, indx , chunk_size)
-
-
-        except Exception as e:
-            logger.logger(level=logger.ERROR , type="elasticsearch", message="Failed pushing the records, unexpected error" , reason=str(e))
-            
-            return [False , "Failed pushing ["+str(len(bulk_queue))+"] records to ["+indx+"] index" , bulk_queue , [] ]
-
-    
     # ================================ fix the errors faced during build_to_elasticsearch
     # this will recevie the failed data from bulk queue and fix it
     # it will return the list of fixed records and nonfixed records
@@ -450,7 +454,7 @@ class ES_DB:
         fixed_data              = []
         nonfixed_data           = []
         limit_fields_increased  = False
-        for _id, doc in errors.iteritems():
+        for _id, doc in errors.items():
             
             record_msg_info = "Indx["+indx+"]"
             if 'machine' in doc['index']['data'].keys():
@@ -487,7 +491,6 @@ class ES_DB:
                 if "Limit of total fields" in doc_reason and limit_fields_increased:
                     fixed_data.append({
                         "_index": doc['index']['_index'],
-                        "_type": doc['index']['_type'],
                         "_id" : doc['index']['_id'],
                         "_source": doc['index']['data']
                     })
@@ -525,7 +528,6 @@ class ES_DB:
                                     
                                     fixed_data.append({
                                         "_index": doc['index']['_index'],
-                                        "_type": doc['index']['_type'],
                                         "_id" : doc['index']['_id'],
                                         "_source": doc['index']['data']
                                     })   
@@ -537,7 +539,6 @@ class ES_DB:
                                     
                                     fixed_data.append({
                                         "_index": doc['index']['_index'],
-                                        "_type": doc['index']['_type'],
                                         "_id" : doc['index']['_id'],
                                         "_source": doc['index']['data']
                                     })   
@@ -555,7 +556,6 @@ class ES_DB:
                         if json_update_val_by_path( doc['index']['data'] , failed_field , '1700-01-01T00:00:00' )[0]:
                             fixed_data.append({
                                 "_index": doc['index']['_index'],
-                                "_type": doc['index']['_type'],
                                 "_id" : doc['index']['_id'],
                                 "_source": doc['index']['data']
                             })   
@@ -575,7 +575,6 @@ class ES_DB:
                                     if json_update_val_by_path( doc['index']['data'] , failed_field , res_str )[0]:
                                         fixed_data.append({
                                             "_index": doc['index']['_index'],
-                                            "_type": doc['index']['_type'],
                                             "_id" : doc['index']['_id'],
                                             "_source": doc['index']['data']
                                         })   
@@ -585,7 +584,6 @@ class ES_DB:
                                     if json_update_val_by_path( doc['index']['data'] , failed_field , res_str )[0]:
                                         fixed_data.append({
                                             "_index": doc['index']['_index'],
-                                            "_type": doc['index']['_type'],
                                             "_id" : doc['index']['_id'],
                                             "_source": doc['index']['data']
                                         })   
@@ -597,7 +595,6 @@ class ES_DB:
                 logger.logger(level=logger.ERROR , type="elasticsearch", message=record_msg_info +" : No fix found for failed record ["+doc['index']['_id']+"] data" , reason=doc['index']['data'])
                 nonfixed_data.append({
                         "_index": doc['index']['_index'],
-                        "_type": doc['index']['_type'],
                         "_id" : doc['index']['_id'],
                         "_source": doc['index']['data']
                     })
@@ -605,7 +602,6 @@ class ES_DB:
                 logger.logger(level=logger.ERROR , type="elasticsearch", message=record_msg_info +" : unsuspected error in fixing record issue" , reason=str(e))
                 nonfixed_data.append({
                         "_index": doc['index']['_index'],
-                        "_type": doc['index']['_type'],
                         "_id" : doc['index']['_id'],
                         "_source": doc['index']['data']
                     })

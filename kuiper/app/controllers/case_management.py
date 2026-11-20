@@ -1392,7 +1392,7 @@ def case_add_tag_ajax(case_id):
         }
         up = db_es.bulk_queue_push( [record] , case_id , chunk_size=500) 
         #db_es.es_add_tag(data = { "Data" : Data  , "data_type" : 'tag' } , case_id = case_id )
-        if up[0] == False:
+        if not up[0] or up[2]:
             logger.logger(level=logger.ERROR , type="case", message="Case["+case_id+"]: Failed adding tag", reason=up[1])
             return json.dumps({'result' : 'failed' , 'data': 'Failed adding tag: ' + up[1]})
 

@@ -4,11 +4,12 @@
 import shutil
 import os
 import urllib
-import importlib
 import re
 from datetime import datetime
 import binascii
 import json
+import hashlib
+from collections import Counter
 from bson import json_util
 from bson.json_util import dumps
 import time
@@ -32,6 +33,106 @@ from celery import Task
 import uuid
 
 import subprocess
+import pickle
+import signal
+import tempfile
+import threading
+
+
+class ParserLeaseLost(RuntimeError):
+    pass
+
+
+class ArtifactRecordIDs(object):
+    """Keep identical events distinct across batches of the same artifact."""
+
+    def __init__(self, machine, parser, path):
+        self.namespace = json.dumps([machine, parser, path], ensure_ascii=True).encode('ascii')
+        self.occurrences = Counter()
+
+    def for_record(self, record):
+        fields = ('Data', 'data_source', 'data_type', 'data_path')
+        payload = {field: record[field] for field in fields if record.get(field) is not None}
+        encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True,
+                             separators=(',', ':')).encode('ascii')
+        fingerprint = hashlib.sha256(encoded).digest()
+        occurrence = self.occurrences[fingerprint]
+        self.occurrences[fingerprint] += 1
+        identity = hashlib.sha256(self.namespace + b'\0' + fingerprint +
+                                  str(occurrence).encode('ascii')).hexdigest()
+        return 'kuiper-v1-' + identity
+
+
+class ParserLease(object):
+    seconds = 120
+
+    def __init__(self, machine_id, owner):
+        self.machine_id = machine_id
+        self.owner = owner
+        self.stopped = threading.Event()
+        self.lost = threading.Event()
+        self.heartbeat = threading.Thread(target=self.renew)
+        self.heartbeat.daemon = True
+
+    def renew(self):
+        while not self.stopped.wait(self.seconds / 4):
+            try:
+                if db_files.renew_parser_lease(self.machine_id, self.owner, self.seconds):
+                    continue
+            except Exception as exc:
+                logger.logger(level=logger.ERROR, type="parser",
+                              message="Failed renewing parser lease", reason=str(exc))
+            self.lost.set()
+            return
+
+    def ensure_active(self):
+        if self.lost.is_set():
+            raise ParserLeaseLost("Lost ownership of the machine parser task")
+
+
+def isolated_parser_batches(module, function, artifact, parser, batch_size, timeout, lease):
+    fd, output_path = tempfile.mkstemp(prefix="kuiper-parser-")
+    os.close(fd)
+    process = None
+    try:
+        runner = os.path.join(os.path.dirname(__file__), '..', 'parser_process.py')
+        process = subprocess.Popen([
+            sys.executable, runner, module, function, artifact, parser,
+            str(batch_size), output_path, str(os.getpid()),
+        ])
+        clock = getattr(time, 'monotonic', time.time)
+        deadline = clock() + timeout
+        while process.poll() is None:
+            lease.ensure_active()
+            if clock() >= deadline:
+                raise RuntimeError("Parser timed out after %s seconds" % timeout)
+            time.sleep(0.1)
+        if process.returncode:
+            raise RuntimeError("Parser process exited with status %s" % process.returncode)
+        with open(output_path, 'rb') as output:
+            while True:
+                try:
+                    batch = pickle.load(output)
+                except EOFError:
+                    break
+                if isinstance(batch, tuple) and batch[0] is False:
+                    raise RuntimeError(batch[1])
+                yield batch
+    finally:
+        if process is not None and process.poll() is None:
+            try:
+                if hasattr(os, 'killpg'):
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except OSError:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            process.wait()
+        os.remove(output_path)
 
 # ================================ json beautifier
 # return json in a beautifier
@@ -147,44 +248,28 @@ class Parser_Manager:
 
                 start_time          = str(datetime.now())
                 
-                # if any parser other than jkson, then collect the parser function information
                 if parser_name != 'kjson':
-                    parser_folder       = parser_details['parser_folder']
-                    parser_file         = parser_details['interface_function'].split('.')[0]
-                    parser_func         = parser_details['interface_function'].split('.')[1]
-                
-                    # import the parser module
-                    logger.logger(level=logger.DEBUG , type="parser", message="Parser["+parser_name+"]: Parser Mudole [app.parsers." + parser_folder + "." + parser_file + "]")
-
-                    try:
-                        parser_module = importlib.import_module('app.parsers.' + parser_folder + '.' + parser_file )
-                    except Exception as e:
-                        # if failed getting the parser modules, then set all files message
-                        self.files_failed += len(files_to_be_parsed)
-                        for f in files_to_be_parsed:
-                            logger.logger(level=logger.ERROR , type="parser", message="Parser["+parser_name+"]: Failed getting parser module to parse ["+f+"]" , reason=str(e))
-                            add_file = self.edit_db_file_status(f , parser_name , start_time , "error" , message=str(e) , end_time=str(datetime.now()) )
-                            if not add_file[0]:
-                                logger.logger(level=logger.ERROR , type="parser", message="Parser["+parser_name+"]: Failed editing file status ["+f+"] to failed" , reason=add_file[1])
-                        
-                        continue
-
+                    parser_module = 'app.parsers.' + parser_details['parser_folder'] + '.'
+                    parser_file, parser_func = parser_details['interface_function'].split('.', 1)
+                    parser_module += parser_file
 
                 num_files_to_be_parsed  = len(files_to_be_parsed)
                 num_files_parsed        = 0
                 # loop over the files to parse them one by one 
                 while len(files_to_be_parsed):
                     try:
-                        # randomly pick on of the files
-                        pos         = random.randint(0,len(files_to_be_parsed)-1)
-                        f           = str(files_to_be_parsed[pos]).encode('utf-8')
-                        file_size   = os.path.getsize( f )
-                        if self.wait_memory_free(file_size):
-                            logger.logger(level=logger.DEBUG , type="parser", message="Parser["+parser_name+"]: Wait to parse file ["+f+"]" , reason="Wait for avaliable memory to start parsing the file")
+                        self.lease.ensure_active()
+                        pos = random.randint(0, len(files_to_be_parsed) - 1)
+                        f = files_to_be_parsed.pop(pos)
+                        start_time = str(datetime.now())
+                        file_size = os.path.getsize(f)
+                        clock = getattr(time, 'monotonic', time.time)
+                        memory_deadline = clock() + self.parser_timeout
+                        while self.wait_memory_free(file_size):
+                            self.lease.ensure_active()
+                            if clock() >= memory_deadline:
+                                raise RuntimeError("Timed out waiting for memory to parse the artifact")
                             time.sleep(5)
-                            continue
-                        
-                        del files_to_be_parsed[pos]
 
                         logger.logger(level=logger.DEBUG , type="parser", message="Parser["+parser_name+"]: Start parsing the file: " , reason=f)
                         
@@ -202,6 +287,7 @@ class Parser_Manager:
                         pushed_records  = 0
                         failed_records  = 0
                         message         = ''
+                        record_ids = ArtifactRecordIDs(self.machine_id, parser_name, f)
                         
                         # ===== call the parser function and push the results to database
                         if parser_name == 'kjson':
@@ -214,7 +300,7 @@ class Parser_Manager:
 
                                     # if the collect lines match the chunk size, then push the data to elasticsearch
                                     if len(kjson_records) == self.es_chunks_size:
-                                        pushing_results = self.fix_and_push_parsed_data(kjson_records , parser_name , f , start_time)
+                                        pushing_results = self.fix_and_push_parsed_data(kjson_records, parser_name, f, record_ids)
                                         pushed          = pushing_results[0]
                                         pushed_records  += pushing_results[1]
                                         failed_records  += pushing_results[2]
@@ -227,79 +313,33 @@ class Parser_Manager:
                                 
 
                                 # if there are data not pushed yet, then push it to elasticsearch
-                                if len(kjson_records):
-                                    pushing_results = self.fix_and_push_parsed_data(kjson_records , parser_name , f , start_time)
+                                if pushed and kjson_records:
+                                    pushing_results = self.fix_and_push_parsed_data(kjson_records, parser_name, f, record_ids)
                                     pushed          = pushing_results[0]
                                     pushed_records  += pushing_results[1]
                                     failed_records  += pushing_results[2]
                                     message         = pushing_results[3]
 
-                                    if pushed == False:
-                                        break
-
-                                    kjson_records = []
-
-
                         else:
-                            # if used parser, not kjson results
-
-                            # === call parser to parse the file
-                            json_res = getattr(parser_module , parser_func)( file=f , parser = parser_name )
-                            
-
-                            if isinstance(json_res , tuple) and json_res[0] is None: # if parser failed, continue to next file
-
-                                logger.logger(level=logger.ERROR , type="parser", message="Parser["+parser_name+"]: Failed parsing file ["+f+"]" , reason=json_res[1])
-
-
-                                add_file = self.edit_db_file_status(f , parser_name , start_time , "error" , message=json_res[1] )
-                                if not add_file[0]:
-                                    logger.logger(level=logger.ERROR , type="parser", message="Parser["+parser_name+"]: Failed editing file status ["+f+"] to failed" , reason=add_file[1])
-                                
-                                continue
-                            
-                            if isinstance(json_res , file):
-                                json_res_path = os.path.realpath(json_res.name)
-                                while True:
-                                    res = getattr(parser_module , parser_func + "_pull")( json_res , self.es_chunks_size )
-                                    
-                                    # if exception found in the function
-                                    if isinstance(res , tuple) and res[0] == False :
-                                        pushed  = False 
-                                        message = res[1]
-                                        break 
-                                    
-                                    # if there is a results to push
-                                    if len(res):
-                                        pushing_results =  self.fix_and_push_parsed_data(res , parser_name , f , start_time)
-                                        pushed          =  pushing_results[0]
-                                        pushed_records  += pushing_results[1]
-                                        failed_records  += pushing_results[2]
-                                        message         =  pushing_results[3]
-                                        if pushed == False:
-                                            break
-                                    else:
-                                        # if there is no more results to push
+                            batches = isolated_parser_batches(
+                                parser_module, parser_func, f, parser_name, self.es_chunks_size,
+                                self.parser_timeout, self.lease,
+                            )
+                            try:
+                                for batch in batches:
+                                    result = self.fix_and_push_parsed_data(batch, parser_name, f, record_ids)
+                                    pushed, indexed, failed, message = result
+                                    pushed_records += indexed
+                                    failed_records += failed
+                                    if not pushed:
                                         break
-
-
-                                # get the real path of the temp file and delete it
-                                json_res.close()
-                                os.remove(json_res_path)
-
-                            else:
-                                pushing_results = self.fix_and_push_parsed_data(json_res , parser_name , f , start_time)
-                                pushed          = pushing_results[0]
-                                pushed_records  = pushing_results[1]
-                                failed_records  = pushing_results[2]
-                                message         = pushing_results[3]
-                                
-                        
+                            finally:
+                                batches.close()
 
                         logger.logger(level=logger.INFO , type="parser", message="Parser["+parser_name+"]: Total pushed records ["+str(pushed_records)+"] and failed ["+str(failed_records)+"]")
 
                         # === add the file as parsed for the provided parser in database
-                        if pushed:
+                        if pushed and not failed_records:
                             add_file = self.edit_db_file_status(f , parser_name , start_time , "done" , message="Pushed ["+str(pushed_records)+"] / Failed ["+str(failed_records)+"]" , end_time=str(datetime.now()) )
                             if not add_file[0]:
                                 logger.logger(level=logger.ERROR , type="parser", message="Parser["+parser_name+"]: Failed editing file status ["+f+"] to parsed" , reason=add_file[1])
@@ -309,11 +349,15 @@ class Parser_Manager:
                             num_files_parsed  += 1 # this counter for current parser files done 
                             self.set_task_state("PROCESSING", self.files_parsed)
                         else:
+                            if pushed:
+                                message = "Elasticsearch or record validation rejected %s records" % failed_records
                             logger.logger(level=logger.ERROR , type="parser", message="Parser["+parser_name+"]: Failed pushing ["+f+"]" , reason=message)
                             add_file = self.edit_db_file_status(f , parser_name , start_time , "error" , message=message + " - pushed rec. " + str(pushed_records) , end_time=str(datetime.now()) )
                             if not add_file[0]:
                                 logger.logger(level=logger.ERROR , type="parser", message="Parser["+parser_name+"]: Failed editing file status ["+f+"] to failed" , reason=add_file[1])
                             
+                    except ParserLeaseLost:
+                        raise
                     except Exception as e:
                         add_file = self.edit_db_file_status(f , parser_name , start_time, "error" , message="Failed: " + str(e) , end_time=str(datetime.now()) )
                         if add_file[0] == False:
@@ -336,17 +380,13 @@ class Parser_Manager:
 
 
 
-    def fix_and_push_parsed_data(self, json_res , parser_name , file_path , start_time):
+    def fix_and_push_parsed_data(self, json_res, parser_name, file_path, record_ids):
+        self.lease.ensure_active()
         pushed          = True
         pushed_records  = 0
         failed_records  = 0
         
         try:
-            # === fix data type issue with received data
-            is_kjson = True if parser_name == 'kjson' else False 
-            
-
-
             logger.logger(level=logger.DEBUG , type="parser", message="Parser["+parser_name+"]: fixed issues with parsed data")
 
 
@@ -383,18 +423,21 @@ class Parser_Manager:
                     
                     logger.logger(level=logger.DEBUG , type="parser", message="Parser["+parser_name+"]: Pushing result of file ["+file_path+"] to elasticsearch")
                     
-                    p = db_es.bulk_queue_push(json_res[ i : (i+self.es_chunks_size) ] ,self.case_id , chunk_size=self.es_chunks_size)
-
-                    if p[0] == False:
-                        return [False, pushed_records , failed_records , p[1]]
-                        
-
-                    logger.logger(level=logger.DEBUG , type="parser", message="Parser["+parser_name+"]: Pushed records ["+str(len(json_res[ i : (i+self.es_chunks_size) ]) - len(p[2]))+"] and failed ["+str(len(p[2]))+"]" , reason=p[1])
-                    pushed_records+=len(json_res[ i : (i+self.es_chunks_size) ]) - len(p[2])
-                    failed_records+=len(p[2])
+                    self.lease.ensure_active()
+                    batch = json_res[i:i + self.es_chunks_size]
+                    ok, message, failed, succeeded = db_es.bulk_queue_push(
+                        batch, self.case_id, chunk_size=self.es_chunks_size,
+                        record_ids=[record_ids.for_record(record) for record in batch],
+                    )
+                    pushed_records += len(succeeded)
+                    failed_records += len(failed)
+                    if not ok:
+                        return [False, pushed_records, failed_records, message]
 
             return [pushed, pushed_records , failed_records , 'pushed']
 
+        except ParserLeaseLost:
+            raise
         except Exception as e:
             return [False, pushed_records , failed_records , str(e)]
 
@@ -628,7 +671,8 @@ class Parser_Manager:
                 },
             "file_size" : os.path.getsize( file )
             }
-        add_file = db_files.add_file(self.machine_id , file_details)
+        self.lease.ensure_active()
+        add_file = db_files.add_file(self.machine_id, file_details, lease_owner=self.lease.owner)
         if add_file[0]:
             return [ True, "Changed ["+file+"] for parser ["+parser_name+"] to: " + status]
         else:
@@ -736,7 +780,7 @@ class Parser_Manager:
     def wait_memory_free(self, needed_size):
         files = db_files.get_by_status('parsing')
         if not files[0]:
-            return [False, files[1]]
+            raise RuntimeError(files[1])
 
         # get files of all parsing files
         parsing_files_size = 0
@@ -759,21 +803,39 @@ class Parser_Manager:
 
 @celery_app.task(name=app.config['celery_task_name'], bind=True)
 def run_parsers(self, main_case_id, machine_case_id, parsers_list):
-    parser_manager = Parser_Manager(
-        main_case_id, machine_case_id, parsers_list, self.request.id, self.update_state
-    )
-    if not parser_manager.specify_files_to_be_parser():
-        raise RuntimeError("Failed collecting the list of files to be parsed")
-    if not parser_manager.start_parsing():
-        raise RuntimeError("Failed processing the files")
+    owner = str(uuid.uuid4())
+    lease = ParserLease(machine_case_id, owner)
+    if not db_files.acquire_parser_lease(machine_case_id, owner, lease.seconds):
+        return {'status': 'already_processing'}
 
-    logger.logger(
-        level=logger.INFO,
-        type="parser",
-        message="Done processing the task case[%s] - machine[%s] - Parsers[%s]"
-        % (main_case_id, machine_case_id, ','.join(parsers_list)),
-    )
-    return parser_manager.task_progress(parser_manager.files_parsed)
+    lease.heartbeat.start()
+    try:
+        db_files.recover_parser_files(machine_case_id, owner)
+        parser_manager = Parser_Manager(
+            main_case_id, machine_case_id, parsers_list, self.request.id, self.update_state
+        )
+        parser_manager.lease = lease
+        parser_manager.parser_timeout = int(os.environ.get('KUIPER_PARSER_TIMEOUT_SECONDS', '900'))
+        if parser_manager.parser_timeout <= 0:
+            raise ValueError("KUIPER_PARSER_TIMEOUT_SECONDS must be positive")
+        if not parser_manager.specify_files_to_be_parser():
+            raise RuntimeError("Failed collecting the list of files to be parsed")
+        if not parser_manager.start_parsing():
+            raise RuntimeError("Failed processing the files")
+        lease.ensure_active()
+        logger.logger(
+            level=logger.INFO, type="parser",
+            message="Done processing the task case[%s] - machine[%s] - Parsers[%s]"
+            % (main_case_id, machine_case_id, ','.join(parsers_list)),
+        )
+        return parser_manager.task_progress(parser_manager.files_parsed)
+    finally:
+        lease.stopped.set()
+        try:
+            db_files.release_parser_lease(machine_case_id, owner)
+        except Exception as exc:
+            logger.logger(level=logger.ERROR, type="parser",
+                          message="Failed releasing parser lease", reason=str(exc))
 
 # this will handle error hapen in the task parser 
 @celery_app.task()

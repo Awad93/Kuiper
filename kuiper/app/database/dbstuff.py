@@ -4,7 +4,7 @@ from werkzeug.security import generate_password_hash
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 from bson import ObjectId
 import sys
@@ -674,14 +674,75 @@ class DB_Files:
 
         self.collection = MClient[DB_NAME]["files"]
 
+    def acquire_parser_lease(self, machine_id, owner, seconds):
+        machine = self.add_machine_in_files(machine_id)
+        if not machine[0]:
+            raise RuntimeError(machine[1])
+        now = datetime.utcnow()
+        return self.collection.find_and_modify(
+            query={'_id': machine_id, '$or': [
+                {'parser_lease': {'$exists': False}},
+                {'parser_lease.expires': {'$lte': now}},
+            ]},
+            update={'$set': {'parser_lease': {
+                'owner': owner, 'expires': now + timedelta(seconds=seconds),
+            }}},
+        ) is not None
+
+    def parser_lease_query(self, machine_id, owner):
+        return {
+            '_id': machine_id,
+            'parser_lease.owner': owner,
+            'parser_lease.expires': {'$gt': datetime.utcnow()},
+        }
+
+    def renew_parser_lease(self, machine_id, owner, seconds):
+        result = self.collection.update(
+            self.parser_lease_query(machine_id, owner),
+            {'$set': {'parser_lease.expires': datetime.utcnow() + timedelta(seconds=seconds)}},
+        )
+        return bool(result.get('n'))
+
+    def release_parser_lease(self, machine_id, owner):
+        self.collection.update({'_id': machine_id, 'parser_lease.owner': owner},
+                               {'$unset': {'parser_lease': ''}})
+
+    def recover_parser_files(self, machine_id, owner):
+        query = self.parser_lease_query(machine_id, owner)
+        machine = self.collection.find_one(query)
+        if machine is None:
+            raise RuntimeError("Parser lease expired before recovery")
+        if not self.reset_interrupted_parsers(machine, query):
+            raise RuntimeError("Parser lease expired during recovery")
+
+    def reset_interrupted_parsers(self, machine, query):
+        changes = {}
+        for file_index, artifact in enumerate(machine['files']):
+            for parser_index, parser in enumerate(artifact['parsers']):
+                status = parser['status']
+                if status in ('queued', 'parsing'):
+                    path = 'files.%s.parsers.%s.' % (file_index, parser_index)
+                    query[path + 'status'] = status
+                    query[path + 'task_id'] = parser.get('task_id')
+                    changes[path + 'status'] = 'pending' if status == 'queued' else 'error'
+                    changes[path + 'message'] = (
+                        'Previous parser task was interrupted. Processing may have indexed some records.'
+                        if status == 'parsing' else 'Previous parser task ended before parsing started.'
+                    )
+        return not changes or bool(self.collection.update(query, {'$set': changes}).get('n'))
+
     # ===================================== Get machine files
     # get all files for specified machine
     def get_by_machine(self, machine_id):
         try:
-            machine_files = self.add_machine_in_files(machine_id) # if machine not in DB add it
-            for p in self.collection.find({'_id' : machine_id}):
-                return [True, p]
-            return [True, None ]
+            found, machine = self.add_machine_in_files(machine_id)
+            if not found:
+                return [False, machine]
+            lease = machine.get('parser_lease')
+            if lease is None or lease['expires'] <= datetime.utcnow():
+                self.reset_interrupted_parsers(machine, {'_id': machine_id, 'parser_lease': lease})
+                machine = self.collection.find_one({'_id': machine_id})
+            return [True, machine]
         except Exception as e:
             return [False, str(e)]
 
@@ -733,7 +794,7 @@ class DB_Files:
 
     # ===================================== Add file
     # add files to the database
-    def add_file(self, machine_id , file_details):
+    def add_file(self, machine_id , file_details, lease_owner=None):
         try:
             machine_files = self.add_machine_in_files(machine_id)
             if machine_files[0] == False:
@@ -768,11 +829,11 @@ class DB_Files:
                 machine_files['files'].append(file_details)
             
             # delete record id
-            del machine_files['_id']
-            
-            # === edit the database with the new list of files
-            up = self.collection.update({'_id':machine_id}, {'$set': machine_files},upsert=False)
-            if up:
+            query = {'_id': machine_id}
+            if lease_owner is not None:
+                query = self.parser_lease_query(machine_id, lease_owner)
+            up = self.collection.update(query, {'$set': {'files': machine_files['files']}}, upsert=False)
+            if up.get('n'):
                 return [True , "File added to database"]
             else:
                 return [False , "Failed to update the record"]
@@ -804,17 +865,16 @@ class DB_Files:
     # get the status of parsers for specific machine
     def get_parsing_progress(self, machine_id):
         try:
-            machine_files = self.add_machine_in_files(machine_id) # if machine not in DB add it
-            if machine_files[0] == False:
-                return machine_files
-
+            found, machine = self.get_by_machine(machine_id)
+            if not found:
+                return [False, machine]
             parsers_progress = {}
-            for db_f in self.collection.find({'_id' : machine_id}):
-                for f in db_f['files']:
-                    for p in f['parsers']:
-                        if p['parser_name'] not in parsers_progress.keys():
-                            parsers_progress[ p['parser_name'] ] = []
-                        parsers_progress[ p['parser_name'] ].append( {'file' : f['file_path'] , 'status' : p['status']} )
+            if machine is not None:
+                for artifact in machine['files']:
+                    for parser in artifact['parsers']:
+                        parsers_progress.setdefault(parser['parser_name'], []).append({
+                            'file': artifact['file_path'], 'status': parser['status'],
+                        })
                         
             return [True, parsers_progress]
         except Exception as e:
@@ -826,6 +886,7 @@ class DB_Files:
         try:
             files = []
             for machine in self.collection.aggregate([
+                        {"$match": {"parser_lease.expires": {"$gt": datetime.utcnow()}}},
                         {"$unwind": "$files"},
                         {"$unwind": "$files.parsers"},
                         {"$match": {"files.parsers.status": status}}
@@ -846,27 +907,18 @@ class DB_Files:
     # update files content based on the provided task id 
     def update_files_by_task_id(self , machine_id , task_id , status , message):
         try:
-            machine_files = self.add_machine_in_files(machine_id) # if machine not in DB add it
-            if machine_files[0] == False:
-                return machine_files
-
-            files = {}
-            for machine in self.collection.find({'_id' : machine_id}):
-                changed = False
-                for f in machine['files']:
-                    for p in f['parsers']:
-                    
-                        if 'task_id' in p.keys() and p['task_id'] == task_id and p['status'] in ['queued' , 'parsing']:
-                            p['status']  = status
-                            p['message'] = message
-                            changed      = True
-                if changed:
-                    up = self.collection.update({'_id':machine_id}, {'$set': machine},upsert=False)
-                    if up:
-                        return [True , "Updated"]
-                    else:
-                        return [False , "Failed to update"]
-
+            machine = self.collection.find_one({'_id': machine_id})
+            if machine is not None:
+                for file_index, artifact in enumerate(machine['files']):
+                    for parser_index, parser in enumerate(artifact['parsers']):
+                        if parser.get('task_id') != task_id or parser['status'] not in ('queued', 'parsing'):
+                            continue
+                        path = 'files.%s.parsers.%s.' % (file_index, parser_index)
+                        self.collection.update(
+                            {'_id': machine_id, path + 'task_id': task_id,
+                             path + 'status': {'$in': ['queued', 'parsing']}},
+                            {'$set': {path + 'status': status, path + 'message': message}},
+                        )
             return [True, 'Updated']
         except Exception as e:
             return [False,  str(e)]
