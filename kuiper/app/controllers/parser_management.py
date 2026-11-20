@@ -307,7 +307,7 @@ class Parser_Manager:
 
                             self.files_parsed += 1 # this counter for total files parsed from all parsers
                             num_files_parsed  += 1 # this counter for current parser files done 
-                            self.update_state("PROCESSING" , self.files_parsed)
+                            self.set_task_state("PROCESSING", self.files_parsed)
                         else:
                             logger.logger(level=logger.ERROR , type="parser", message="Parser["+parser_name+"]: Failed pushing ["+f+"]" , reason=message)
                             add_file = self.edit_db_file_status(f , parser_name , start_time , "error" , message=message + " - pushed rec. " + str(pushed_records) , end_time=str(datetime.now()) )
@@ -684,13 +684,16 @@ class Parser_Manager:
     # ================================ Celery task state
     # set celery task state
     def set_task_state(self, status, total_parsed_files=0):
-        self.update_state(status=status , meta={
+        self.update_state(state=status, meta=self.task_progress(total_parsed_files))
+
+    def task_progress(self, total_parsed_files):
+        return {
             'case'          : self.case_id,
             'machine'       : self.machine_id,
             'parsers'       : ','.join(self.parsers_list),
             'files_done'    : total_parsed_files,
             'total_files'   : self.tmp_total_files
-        })
+        }
 
 
     # ================================ convert fields values to string
@@ -754,29 +757,23 @@ class Parser_Manager:
 #               Celery Functions
 # =================================================
 
-# run parsers  
-@celery_app.task(name=app.config['celery_task_name'] , bind=True)
-def run_parsers(self, main_case_id,machine_case_id,parsers_list):
-    
-    parser_manager = Parser_Manager(main_case_id , machine_case_id , parsers_list , self.request.id , self.update_state )
-    
-    try:
+@celery_app.task(name=app.config['celery_task_name'], bind=True)
+def run_parsers(self, main_case_id, machine_case_id, parsers_list):
+    parser_manager = Parser_Manager(
+        main_case_id, machine_case_id, parsers_list, self.request.id, self.update_state
+    )
+    if not parser_manager.specify_files_to_be_parser():
+        raise RuntimeError("Failed collecting the list of files to be parsed")
+    if not parser_manager.start_parsing():
+        raise RuntimeError("Failed processing the files")
 
-        if parser_manager.specify_files_to_be_parser():
-            if parser_manager.start_parsing():
-                parser_manager.update_state("SUCCESS" , parser_manager.files_parsed)
-                logger.logger(level=logger.INFO , type="parser", message="Done processing the task case[" + main_case_id + "] - machine[" + machine_case_id + "] - Parsers["+','.join(parsers_list)+"]")
-            else:
-                parser_manager.update_state("FAILURE" , parser_manager.files_parsed)
-        else:
-            parser_manager.update_state("FAILURE" )
-        
-
-    except Exception as e:
-        exc_type, exc_obj, exc_tb = sys.exc_info()
-        
-        parser_manager.update_state(status='FAILURE')
-        logger.logger(level=logger.ERROR , type="parser", message="Failed starting the task to process ["+main_case_id+">"+machine_case_id+"] the artifacts" , reason="Line No. " + str(exc_tb.tb_lineno) + " - " + str(e))
+    logger.logger(
+        level=logger.INFO,
+        type="parser",
+        message="Done processing the task case[%s] - machine[%s] - Parsers[%s]"
+        % (main_case_id, machine_case_id, ','.join(parsers_list)),
+    )
+    return parser_manager.task_progress(parser_manager.files_parsed)
 
 # this will handle error hapen in the task parser 
 @celery_app.task()
