@@ -1,33 +1,25 @@
-import os
-import sys
-import subprocess
-import json
 import ast
+import json
+import os
+import subprocess
 
-def auto_interface(file,parser):
+
+def auto_interface(file, parser):
     try:
-        CurrentPath=os.path.dirname(os.path.abspath(__file__))
-        proc = subprocess.Popen('python3 "'+ CurrentPath+'/werpar.py" "' + file + '"', shell=True ,stdout=subprocess.PIPE)
-        res = proc.communicate()[0].split('\n')
-        data = ""
-        for line in res:
-            if line.startswith('['):
-                data += line
-        if data == "":
-            return []
-        d = []
-        for i in ast.literal_eval(data):
-            if type(i) == dict:
-                if len(i.keys()):
-                    d.append(i)
-                else:
-                    continue
-            else:
-                d.append(json.loads(i) )
-        return d
-    except Exception as e:
-        exc_type,exc_obj,exc_tb = sys.exc_info()
-        msg = "[-] [Error] " + str(parser) + " Parser: " + str(exc_obj) + " - Line No. " + str(exc_tb.tb_lineno)
-        print msg
-        return (None , msg)
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'werpar.py')
+        proc = subprocess.Popen(['python3', script, file], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        stdout, stderr = proc.communicate()
+        if proc.returncode:
+            lines = stderr.decode('utf-8', 'replace').strip().splitlines()
+            detail = lines[-1] if lines else "subprocess exited with status %s" % proc.returncode
+            return (None, "%s parser: %s" % (parser, detail))
+
+        records = ast.literal_eval(stdout.decode('utf-8'))
+        if not isinstance(records, list):
+            raise ValueError("expected a list of records")
+        return [record if isinstance(record, dict) else json.loads(record)
+                for record in records if record != {}]
+    except Exception as exc:
+        return (None, "%s parser: %s" % (parser, exc))
 

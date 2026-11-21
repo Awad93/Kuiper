@@ -9,8 +9,7 @@ import yaml
 import zipfile
 import hashlib
 import base64
-import tarfile
-import subprocess
+import uuid
 
 from datetime import datetime
 
@@ -20,6 +19,7 @@ from flask import jsonify
 from flask import send_file
 
 from app import app
+from app.archive_upload import extract_archive, is_archive_upload
 
 import parser_management
 
@@ -92,71 +92,6 @@ def md5(fname):
         return [False, str(e)]
 
 
-# ================================ decompress file
-# decompress the provided file to the dst_path
-def decompress_file(archive_path,dst_path):
-    try:
-        createfolders = create_folders(dst_path)
-        if createfolders[0] == False:
-            return createfolders
-        
-        # decompress archive based on archive type
-        if zipfile.is_zipfile(archive_path):
-            unzip_file(archive_path, dst_path)
-        elif tarfile.is_tarfile(archive_path):
-            untar_file(archive_path, dst_path)
-        else:
-            raise Exception("File [" + archive_path + "] is not an archive")
-        return [True , "All files of ["+archive_path+"] extracted to ["+dst_path+"]"]
-
-    except UnicodeDecodeError as e:
-        #handle unicode errors, like utf-8 codec issues
-        return [True , "All files of ["+archive_path+"] partially extracted to ["+dst_path+"]"]
-    except Exception as e:
-        return [False, "Error extracting the archive content: " + str(e)]
-
- 
-# ================================ unzip file  
-# unzip the provided file to the dst_path
-def unzip_file(zip_path, dst_path): 
-    try:
-        with zipfile.ZipFile(zip_path , mode='r') as zfile:
-            zfile.extractall(path=dst_path)
-    except:
-        # if failed to extract using ZipFile, use 7z
-        p = subprocess.Popen(" ".join(["7z", "x", zip_path, "-o" + dst_path, "-y" , ">" , "/dev/nul"]), stdout=subprocess.PIPE, shell=True)
-        p_status = p.wait()
-
-# ================================ is within directory
-# check if target is within a given directory
-def is_within_directory(directory, target):
-    abs_directory = os.path.abspath(directory)
-    abs_target = os.path.abspath(target)
-
-    prefix = os.path.commonprefix([abs_directory, abs_target])
-
-    return prefix == abs_directory
-
-
-# ================================ safe tar extraction
-# Safe extraction of tar file to avoid path traversal vulnerability (CVE-2007-4559)
-# Patch taken from https://github.com/dbt-labs/dbt-core/pull/5981/files
-def safe_tar_extract(tar, dst_path):
-    for member in tar.getmembers():
-        member_path = os.path.join(dst_path, member.name)
-        if not is_within_directory(directory=dst_path, target=member_path):
-            raise Exception("Attempted Path Traversal in Tar File")
-
-    tar.extractall(path=dst_path)
-
-
-# ================================ untar file
-# untar the provided file to the dst_path
-def untar_file(tar_path, dst_path):
-    with tarfile.open(tar_path , mode='r') as tfile:
-        safe_tar_extract(tfile, dst_path)
-
-
 # ================================ list zip file content
 # list zip file content
 def list_zip_file(zip_path):
@@ -214,7 +149,8 @@ def upload_file(file , case_id , machine=None , base64_name=None):
     logger.logger(level=logger.DEBUG , type="case", message="Case["+case_id+"]: Handle uploaded file ["+source_filename+"]")
     # ====== prepare the variables 
     
-    temp_filename   = str(datetime.now() ).split('.')[0].replace(' ' , 'T') + "-" + source_filename
+    timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+    temp_filename = "%s-%s-%s" % (timestamp, uuid.uuid4().hex[:12], source_filename)
     
     if isUploadMachine:
         # if the option is upload machine
@@ -271,7 +207,7 @@ def upload_file(file , case_id , machine=None , base64_name=None):
             file.save(raw_folder + temp_filename)   
         except Exception as e:
             logger.logger(level=logger.ERROR , type="case", message="Case["+case_id+"]: Failed saving the file ["+source_filename+"]", reason=str(e))
-            return jsonify({'result' : False , 'filename' : source_filename , 'message' : 'Failed saving the file ['+source_filename+']: ' + str(e)})
+            return [False, {'result': False, 'filename': source_filename, 'message': 'Failed saving the uploaded file: ' + str(e)}]
         
 
         # ======= check hash if exists        
@@ -279,48 +215,22 @@ def upload_file(file , case_id , machine=None , base64_name=None):
         # get hash values for all files for this machine
         for (dirpath, dirnames, filenames) in os.walk(raw_folder):
             for f in filenames:
-                if md5(dirpath + f) == file_hash and f != temp_filename:
+                if f != temp_filename and os.path.isdir(os.path.join(files_folder, f)) and (
+                    file_hash[0] and md5(os.path.join(dirpath, f)) == file_hash
+                ):
                     logger.logger(level=logger.ERROR , type="case", message="Case["+case_id+"]: Failed uploading file ["+temp_filename+"]", reason="Match same hash of file ["+f+"]")
                     return [False, {'result': False , 'filename': source_filename , 'message' : 'The following two files has same MD5 hash<br > - Uploaded: ' + temp_filename + '<br > - Exists: '+f}]
         
 
-        # ====== decompress zip file or move it to files folder
-        if zipfile.is_zipfile(raw_folder + temp_filename) or tarfile.is_tarfile(raw_folder + temp_filename):
-            # if archive
-            # decompress the file to machine files
+        raw_path = os.path.join(raw_folder, temp_filename)
+        if is_archive_upload(raw_path, source_filename):
             try:
-                unzip_fun = decompress_file(raw_folder + temp_filename, files_folder + temp_filename + "/")
-
-                if unzip_fun[0] == True:
-                    pass
-                    # if RemoveRawFiles:
-                    #     # remove the raw file
-                    #     remove_raw_files = remove_file(raw_folder + temp_filename)
-                    #     if remove_raw_files[0] == False:
-                    #         logger.logger(level=logger.WARNING , type="case", message="Case["+case_id+"]: Failed removing raw file ["+raw_folder + temp_filename+"]", reason=remove_raw_files[1])
-
- 
-                else:
-                    # remove_raw_files = remove_file(raw_folder +  temp_filename) # remove file if exists
-                    # if remove_raw_files[0] == False:
-                    #     logger.logger(level=logger.WARNING , type="case", message="Case["+case_id+"]: Failed removing raw file ["+raw_folder + temp_filename+"]", reason=remove_raw_files[1])
-
-                    # remove_files_folder = remove_folder(files_folder + temp_filename + "/") # remove file if exists
-                    # if remove_files_folder[0] == False:
-                    #     logger.logger(level=logger.WARNING , type="case", message="Case["+case_id+"]: Failed removing files folder ["+files_folder + temp_filename + "/"+"]", reason=remove_files_folder[1])
-                    
-
-                    logger.logger(level=logger.ERROR , type="case", message="Case["+case_id+"]: Failed decompressing the file ["+raw_folder + temp_filename+"]", reason=unzip_fun[1])
-                    return [False, {'result' : False , 'filename' : source_filename , 'message' : unzip_fun[1]}]
-            
-            # if unzip failed
-            except Exception as e:
-                if 'password required' in str(e):
-                    logger.logger(level=logger.ERROR , type="case", message="Case["+case_id+"]: Failed decompressing the file ["+raw_folder + temp_filename+"]", reason='password required')
-                    return [False, {'result' : False , 'filename' : source_filename , 'message' : 'File require password'}]
-                else:
-                    logger.logger(level=logger.ERROR , type="case", message="Case["+case_id+"]: Failed decompressing the file ["+raw_folder + temp_filename+"]", reason=str(e))
-                    return [False, {'result' : False , 'filename' : source_filename , 'message' : 'Failed to unzip the file: ' + str(e)}]
+                extract_archive(raw_path, os.path.join(files_folder, temp_filename))
+            except Exception as exc:
+                message = "Error extracting the archive content: " + str(exc)
+                logger.logger(level=logger.ERROR, type="case",
+                              message="Failed decompressing [%s]" % raw_path, reason=message)
+                return [False, {'result': False, 'filename': source_filename, 'message': message}]
         else:
             # if not archive
 
