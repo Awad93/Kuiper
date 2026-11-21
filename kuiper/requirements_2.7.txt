@@ -23,7 +23,7 @@ webapp2==2.5.2
 winjob==0.0.12
 PyYAML==5.1.2
 pytest==4.6.6
-Flask-Celery-Helper
+Flask-Celery-Helper==1.1.0
 urllib3==1.24.1
 python-registry==1.0.4
 python-evtx==0.6.1

@@ -10,9 +10,18 @@ permissions:
   contents: read
 
 jobs:
+  python3-parser-fixtures:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python kuiper/tests/runtime_fixtures.py
+
   ingestion-and-restore:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       KUIPER_ES_JAVA_OPTS: "-Xms1g -Xmx1g"
       KUIPER_ES_MEMORY_LIMIT: "2g"
@@ -25,8 +34,13 @@ jobs:
           mkdir -p elasticsearch backups/snapshots
           sudo chown 1000:0 elasticsearch backups/snapshots
           docker compose config --quiet
-          docker compose pull flask celery mongodb es01 redis
+          docker compose pull mongodb es01 redis
+          docker compose build --pull flask celery
           docker compose up --wait --wait-timeout 240 flask celery
+      - name: Verify parser fixtures in the built runtime
+        run: |
+          docker compose exec -T celery python2 tests/runtime_fixtures.py
+          docker compose exec -T celery python3 tests/runtime_fixtures.py
       - name: Ingest valid and invalid artifacts through Flask and Celery
         run: bash scripts/ingestion-smoke.sh seed
       - name: Back up the case and start an empty target stack

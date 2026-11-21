@@ -49,3 +49,11 @@ The script checks both sets of checksums before writing data. If restore fails a
 Open representative cases in the UI. Compare artifact statuses and Elasticsearch counts with the source, check an inactive case, and compare SHA-256 hashes of sampled raw and extracted evidence. Confirm the indexed records still belong to the expected machines. The ingestion workflow runs these checks on a synthetic case after restoring to fresh storage.
 
 See [Compose startup ordering](https://docs.docker.com/compose/how-tos/startup-order/) and [Elasticsearch snapshot and restore](https://www.elastic.co/docs/deploy-manage/tools/snapshot-and-restore).
+
+## Rebuild the Flask and Celery images
+
+Run `docker compose build --pull flask celery` from the repository root. Both images use the same digest-pinned Python 2.7 base, signed Debian Buster archive repositories, exact direct and transitive Python package versions, and a checksummed nDPI source revision. The archived OS packages and Python 2 runtime are a compatibility baseline.
+
+The ingestion workflow builds both application images from the checked-out source. It runs the same Exchange and WER fixtures under the bundled Python 2.7 and 3.7 interpreters and under Python 3.12. To check a candidate interpreter locally, run `python kuiper/tests/runtime_fixtures.py` with that interpreter and its `python3` helper on the path.
+
+When updating a pin, update the matching package list under `kuiper/` or `docker/runtime/`, rebuild, and run the ingestion workflow. Expand the fixture coverage before switching the production worker or Flask to Python 3.
