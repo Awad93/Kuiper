@@ -9,7 +9,8 @@ from datetime import datetime
 import binascii
 import json
 import hashlib
-from collections import Counter
+import sqlite3
+from contextlib import closing
 from bson import json_util
 from bson.json_util import dumps
 import time
@@ -35,8 +36,11 @@ import uuid
 import subprocess
 import pickle
 import signal
-import tempfile
 import threading
+try:
+    from queue import Empty, Full, Queue
+except ImportError:
+    from Queue import Empty, Full, Queue
 
 
 class ParserLeaseLost(RuntimeError):
@@ -48,7 +52,14 @@ class ArtifactRecordIDs(object):
 
     def __init__(self, machine, parser, path):
         self.namespace = json.dumps([machine, parser, path], ensure_ascii=True).encode('ascii')
-        self.occurrences = Counter()
+        # The occurrence table can outgrow memory on large, mostly unique logs.
+        self.occurrences = sqlite3.connect('')
+        self.occurrences.execute('PRAGMA temp_store = FILE')
+        self.occurrences.execute('PRAGMA cache_size = -1024')
+        self.occurrences.execute('CREATE TABLE events (fingerprint BLOB PRIMARY KEY, count INTEGER)')
+
+    def close(self):
+        self.occurrences.close()
 
     def for_record(self, record):
         fields = ('Data', 'data_source', 'data_type', 'data_path')
@@ -56,8 +67,14 @@ class ArtifactRecordIDs(object):
         encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True,
                              separators=(',', ':')).encode('ascii')
         fingerprint = hashlib.sha256(encoded).digest()
-        occurrence = self.occurrences[fingerprint]
-        self.occurrences[fingerprint] += 1
+        key = sqlite3.Binary(fingerprint)
+        row = self.occurrences.execute(
+            'SELECT count FROM events WHERE fingerprint = ?', (key,)
+        ).fetchone()
+        occurrence = row[0] if row else 0
+        self.occurrences.execute(
+            'INSERT OR REPLACE INTO events VALUES (?, ?)', (key, occurrence + 1)
+        )
         identity = hashlib.sha256(self.namespace + b'\0' + fingerprint +
                                   str(occurrence).encode('ascii')).hexdigest()
         return 'kuiper-v1-' + identity
@@ -91,34 +108,61 @@ class ParserLease(object):
 
 
 def isolated_parser_batches(module, function, artifact, parser, batch_size, timeout, lease):
-    fd, output_path = tempfile.mkstemp(prefix="kuiper-parser-")
-    os.close(fd)
-    process = None
-    try:
-        runner = os.path.join(os.path.dirname(__file__), '..', 'parser_process.py')
-        process = subprocess.Popen([
-            sys.executable, runner, module, function, artifact, parser,
-            str(batch_size), output_path, str(os.getpid()),
-        ])
-        clock = getattr(time, 'monotonic', time.time)
-        deadline = clock() + timeout
-        while process.poll() is None:
-            lease.ensure_active()
-            if clock() >= deadline:
-                raise RuntimeError("Parser timed out after %s seconds" % timeout)
-            time.sleep(0.1)
-        if process.returncode:
-            raise RuntimeError("Parser process exited with status %s" % process.returncode)
-        with open(output_path, 'rb') as output:
-            while True:
+    runner = os.path.join(os.path.dirname(__file__), '..', 'parser_process.py')
+    process = subprocess.Popen([
+        sys.executable, runner, module, function, artifact, parser,
+        str(batch_size), str(os.getpid()),
+    ], stdout=subprocess.PIPE)
+    batches = Queue(maxsize=1)
+    stopped = threading.Event()
+
+    def read_batches():
+        while not stopped.is_set():
+            try:
+                batch = pickle.load(process.stdout)
+            except (EOFError, IOError, ValueError, pickle.UnpicklingError):
+                batch = (False, "Parser process closed its record stream before completing")
+            while not stopped.is_set():
                 try:
-                    batch = pickle.load(output)
-                except EOFError:
+                    batches.put(batch, timeout=0.1)
                     break
-                if isinstance(batch, tuple) and batch[0] is False:
+                except Full:
+                    continue
+            if isinstance(batch, tuple):
+                return
+
+    reader = threading.Thread(target=read_batches)
+    reader.daemon = True
+    reader.start()
+    clock = getattr(time, 'monotonic', time.time)
+    deadline = clock() + timeout
+    try:
+        while True:
+            lease.ensure_active()
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise RuntimeError("Parser timed out after %s seconds" % timeout)
+            try:
+                batch = batches.get(timeout=min(remaining, 0.1))
+            except Empty:
+                continue
+            if isinstance(batch, tuple):
+                if not batch[0]:
                     raise RuntimeError(batch[1])
-                yield batch
+                while process.poll() is None:
+                    lease.ensure_active()
+                    if clock() >= deadline:
+                        raise RuntimeError("Parser timed out after %s seconds" % timeout)
+                    time.sleep(0.1)
+                if process.returncode:
+                    raise RuntimeError("Parser process exited with status %s" % process.returncode)
+                return
+            paused = clock()
+            yield batch
+            # The pipe applies backpressure while Elasticsearch consumes a batch.
+            deadline += clock() - paused
     finally:
+        stopped.set()
         if process is not None and process.poll() is None:
             try:
                 if hasattr(os, 'killpg'):
@@ -132,7 +176,20 @@ def isolated_parser_batches(module, function, artifact, parser, batch_size, time
                     except OSError:
                         pass
             process.wait()
-        os.remove(output_path)
+        reader.join()
+        process.stdout.close()
+
+def kjson_batches(path, size):
+    with open(path, 'r') as stream:
+        batch = []
+        for line in stream:
+            batch.append(json.loads(line))
+            if len(batch) == size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
 
 # ================================ json beautifier
 # return json in a beautifier
@@ -150,7 +207,7 @@ class Parser_Manager:
     tmp_total_files = 0 # the total number of files to be parsed
     files_parsed    = 0 # number of files already parsed
     files_failed    = 0 # number of files failed
-    es_chunks_size  = 20000
+    es_chunks_size  = 1000
 
 
     # this initializer used by the task processor
@@ -259,13 +316,14 @@ class Parser_Manager:
                 while len(files_to_be_parsed):
                     try:
                         self.lease.ensure_active()
+                        pushed_records = 0
                         pos = random.randint(0, len(files_to_be_parsed) - 1)
                         f = files_to_be_parsed.pop(pos)
                         start_time = str(datetime.now())
-                        file_size = os.path.getsize(f)
+                        memory_estimate = self.artifact_memory_estimate(f, parser_name)
                         clock = getattr(time, 'monotonic', time.time)
                         memory_deadline = clock() + self.parser_timeout
-                        while self.wait_memory_free(file_size):
+                        while self.wait_memory_free(memory_estimate):
                             self.lease.ensure_active()
                             if clock() >= memory_deadline:
                                 raise RuntimeError("Timed out waiting for memory to parse the artifact")
@@ -284,57 +342,24 @@ class Parser_Manager:
                         
                         # === push the results to elasticsearch
                         pushed          = True
-                        pushed_records  = 0
                         failed_records  = 0
                         message         = ''
-                        record_ids = ArtifactRecordIDs(self.machine_id, parser_name, f)
-                        
-                        # ===== call the parser function and push the results to database
                         if parser_name == 'kjson':
-                            # ===== collect and push the kjson file results
-                            kjson_records = []
-                            with open(f , 'r') as kjson_handle:
-                                for rec in kjson_handle:
-                                    json_res = json.loads(rec)
-                                    kjson_records.append(json_res) 
-
-                                    # if the collect lines match the chunk size, then push the data to elasticsearch
-                                    if len(kjson_records) == self.es_chunks_size:
-                                        pushing_results = self.fix_and_push_parsed_data(kjson_records, parser_name, f, record_ids)
-                                        pushed          = pushing_results[0]
-                                        pushed_records  += pushing_results[1]
-                                        failed_records  += pushing_results[2]
-                                        message         = pushing_results[3]
-
-                                        if pushed == False:
-                                            break
-                                        
-                                        kjson_records = []
-                                
-
-                                # if there are data not pushed yet, then push it to elasticsearch
-                                if pushed and kjson_records:
-                                    pushing_results = self.fix_and_push_parsed_data(kjson_records, parser_name, f, record_ids)
-                                    pushed          = pushing_results[0]
-                                    pushed_records  += pushing_results[1]
-                                    failed_records  += pushing_results[2]
-                                    message         = pushing_results[3]
-
+                            batches = kjson_batches(f, self.es_chunks_size)
                         else:
                             batches = isolated_parser_batches(
                                 parser_module, parser_func, f, parser_name, self.es_chunks_size,
                                 self.parser_timeout, self.lease,
                             )
-                            try:
-                                for batch in batches:
-                                    result = self.fix_and_push_parsed_data(batch, parser_name, f, record_ids)
-                                    pushed, indexed, failed, message = result
-                                    pushed_records += indexed
-                                    failed_records += failed
-                                    if not pushed:
-                                        break
-                            finally:
-                                batches.close()
+                        with closing(batches), closing(ArtifactRecordIDs(self.machine_id, parser_name, f)) as record_ids:
+                            for batch in batches:
+                                pushed, indexed, failed, message = self.fix_and_push_parsed_data(
+                                    batch, parser_name, f, record_ids,
+                                )
+                                pushed_records += indexed
+                                failed_records += failed
+                                if not pushed:
+                                    break
 
                         logger.logger(level=logger.INFO , type="parser", message="Parser["+parser_name+"]: Total pushed records ["+str(pushed_records)+"] and failed ["+str(failed_records)+"]")
 
@@ -359,7 +384,7 @@ class Parser_Manager:
                     except ParserLeaseLost:
                         raise
                     except Exception as e:
-                        add_file = self.edit_db_file_status(f , parser_name , start_time, "error" , message="Failed: " + str(e) , end_time=str(datetime.now()) )
+                        add_file = self.edit_db_file_status(f , parser_name , start_time, "error" , message="Failed: %s (records pushed: %s)" % (e, pushed_records), end_time=str(datetime.now()) )
                         if add_file[0] == False:
                             logger.logger(level=logger.ERROR , type="parser", message="Parser["+parser_name+"]: Failed editing file status ["+f+"] to parsed" , reason=add_file[1])
                             continue
@@ -671,6 +696,8 @@ class Parser_Manager:
                 },
             "file_size" : os.path.getsize( file )
             }
+        if status == 'parsing':
+            file_details['parsers']['memory_estimate'] = self.artifact_memory_estimate(file, parser_name)
         self.lease.ensure_active()
         add_file = db_files.add_file(self.machine_id, file_details, lease_owner=self.lease.owner)
         if add_file[0]:
@@ -777,6 +804,11 @@ class Parser_Manager:
     # =============================== Check avaliable memory
     # this function check the files size in parsing status and the avaliable memory space
     # then check if the following file can be parsed on the memory or not
+    def artifact_memory_estimate(self, path, parser_name):
+        if parser_name in ('kjson', 'Exchange Logs'):
+            return 64 * 1024 * 1024
+        return os.path.getsize(path)
+
     def wait_memory_free(self, needed_size):
         files = db_files.get_by_status('parsing')
         if not files[0]:
@@ -785,7 +817,7 @@ class Parser_Manager:
         # get files of all parsing files
         parsing_files_size = 0
         for f in files[1]:
-            parsing_files_size += f['file_size']
+            parsing_files_size += f['parser'].get('memory_estimate', f['file_size'])
 
         available_memory    = dict(psutil.virtual_memory()._asdict())['available']
         

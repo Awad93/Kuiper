@@ -125,16 +125,57 @@ class ParserTaskTest(unittest.TestCase):
                 [{"line": "first"}], [{"line": "second"}],
             ])
 
+    def test_records_reach_worker_before_parser_finishes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            signal_path = os.path.join(folder, "continue")
+            batches = self.isolated_batches(
+                "tests.parser_fixture", "generate", signal_path, "stream", 1, 5, Mock()
+            )
+            self.addCleanup(batches.close)
+            self.assertEqual(next(batches), [{"record": 1}])
+            with open(signal_path, "w"):
+                pass
+            self.assertEqual(list(batches), [[{"record": 2}]])
+
+    def test_parser_failure_after_a_batch_is_still_reported(self):
+        batches = self.isolated_batches(
+            "tests.parser_fixture", "generate", "unused", "fail-after-first", 1, 5, Mock()
+        )
+        self.addCleanup(batches.close)
+        self.assertEqual(next(batches), [{"record": 1}])
+        with self.assertRaisesRegex(RuntimeError, "failed after first batch"):
+            next(batches)
+
+    def test_exchange_logs_stream_utf8_rows_with_original_fields(self):
+        parser_path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "parsers", "exchange_logs",
+            "exchange_log_interface.py",
+        )
+        parse = runpy.run_path(parser_path)["exchange_log_interface"]
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "ECPServer.log")
+            with open(path, "w", encoding="utf-8-sig", newline="") as stream:
+                stream.write("#Software: Exchange\r\n#Fields: TimeStamp,EventData\r\n")
+                stream.write('2020-01-01T00:00:00Z,"caf\u00e9, example"\r\n' * 5000)
+            records = parse(path, "Exchange Logs")
+            first = next(records)
+            self.assertEqual(first["EventData"], "caf\u00e9, example")
+            self.assertEqual(first["@timestamp"], first["TimeStamp"])
+            self.assertEqual(sum(1 for _ in records), 4999)
+
     def test_record_identity_survives_reordering_and_distinguishes_occurrences(self):
         record = {"Data": {"a": "one", "b": "two"}}
         other = {"Data": {"a": "different"}}
         first_run = self.artifact_record_ids("machine", "parser", "artifact")
         replay = self.artifact_record_ids("machine", "parser", "artifact")
+        self.addCleanup(first_run.close)
+        self.addCleanup(replay.close)
         original = [first_run.for_record(event) for event in (record, other, record)]
         repeated = [replay.for_record(event) for event in (other, record, record)]
         self.assertEqual(len(set(original)), 3)
         self.assertCountEqual(original, repeated)
         another_artifact = self.artifact_record_ids("machine", "parser", "another-path")
+        self.addCleanup(another_artifact.close)
         self.assertNotIn(another_artifact.for_record(record), original)
 
 

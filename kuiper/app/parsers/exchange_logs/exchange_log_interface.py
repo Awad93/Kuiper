@@ -1,4 +1,3 @@
-import sys
 import codecs
 #Software: Microsoft Exchange Server
 #Version: 15.0.0.0
@@ -14,7 +13,7 @@ def get_fields(lines):
     for line in lines:
         i += 1
         if line.startswith("#Fields: "):
-            fields = str(line[9:]).replace("\r\n", "").split(",")
+            fields = line[9:].rstrip("\r\n").split(",")
             return fields
 
         if not line.startswith("#") and i > 1:
@@ -57,7 +56,7 @@ def log_line_to_json(line, fields):
 
     res = {}
 
-    line_split = split_log_line(line.encode('utf-8').replace("\r\n", ""))
+    line_split = split_log_line(line.rstrip("\r\n"))
     for i in range(len(line_split)):
         if i < len(fields):
             res[fields[i]] = line_split[i]
@@ -79,25 +78,12 @@ def log_line_to_json(line, fields):
 
 
 def exchange_log_interface(file, parser):
-    try:
-        with codecs.open(file, 'r', 'utf-8-sig') as fp:
-            lines = fp.readlines()
-        
-        fields = get_fields(lines)
+    with codecs.open(file, 'r', 'utf-8-sig') as stream:
+        fields = get_fields(stream)
         if fields is None:
-            return (None, "Unable to find fields in file header")
+            raise ValueError("Unable to find fields in file header")
 
-        res = []
-        i = 0
-        for line in lines:
-            i += 1
-            if i > 1:
-                record = log_line_to_json(line, fields)
-                if record is not None:
-                    res.append(record)
-
-        return res
-    except Exception as e:
-        exc_type, exc_obj, exc_tb = sys.exc_info()
-        msg = "[-] [Error] " + parser + " Parser: " + str(exc_obj) + " - Line No. " + str(exc_tb.tb_lineno)
-        return (None, msg)
+        for line in stream:
+            record = log_line_to_json(line, fields)
+            if record is not None:
+                yield record

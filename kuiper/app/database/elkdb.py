@@ -380,6 +380,7 @@ class ES_DB:
                 for ok, item in helpers.streaming_bulk(
                     self.bulk_db, list(pending.values()), chunk_size=chunk_size,
                     raise_on_error=False, raise_on_exception=True,
+                    max_chunk_bytes=5 * 1024 * 1024,
                     request_timeout=self.bulk_request_timeout,
                 ):
                     operation, result = next(iter(item.items()))
