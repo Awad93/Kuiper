@@ -15,7 +15,9 @@ def push_kuiper(url_api, api_token, service,health):
         'datetime'      : str(datetime.now())
     }
     json_string     = json.dumps({'data': json_request})
-    response        = requests.post(url_api + "/api/system_health/update", data=json_string , verify=False)
+    response = requests.post(url_api + "/api/system_health/update", data=json_string,
+                             verify=False, timeout=(3, 10))
+    response.raise_for_status()
     response_json 	= json.loads(response.content)
 
     return response_json['result']

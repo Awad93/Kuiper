@@ -9,3 +9,4 @@
 ./kuiper/app/parsers/WinEvents/temp/*
 ./kuiper/app/parsers/MFT_Parser/temp/*
 ./kuiper/**/*.pyc
+backups/

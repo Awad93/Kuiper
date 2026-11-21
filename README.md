@@ -215,6 +215,10 @@ docker-compose logs -f --tail=100 <service>
 ```
 
 
+### Health checks and disaster recovery
+
+See the [operations runbook](docs/backup-and-restore.md) for Compose health checks, resource limits, and backing up and restoring case data and evidence.
+
 # Kuiper API
 
 Kuiper has a limited feature API, check the repo [DFIRKuiperAPI](https://github.com/DFIRKuiper/DFIRKuiperAPI). 

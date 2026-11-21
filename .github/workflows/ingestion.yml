@@ -1,0 +1,55 @@
+name: Ingestion and recovery
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ingestion-and-restore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      KUIPER_ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+      KUIPER_ES_MEMORY_LIMIT: "2g"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare the disposable stack
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          if [[ ! -c /dev/fuse ]]; then sudo modprobe fuse; fi
+          mkdir -p elasticsearch backups/snapshots
+          sudo chown 1000:0 elasticsearch backups/snapshots
+          docker compose config --quiet
+          docker compose pull flask celery mongodb es01 redis
+          docker compose up --wait --wait-timeout 240 flask celery
+      - name: Ingest valid and invalid artifacts through Flask and Celery
+        run: bash scripts/ingestion-smoke.sh seed
+      - name: Back up the case and start an empty target stack
+        run: |
+          docker compose stop flask celery
+          bash scripts/kuiper-backup.sh backup ci-drill
+          docker compose down
+          mkdir backups/ci-original
+          mv elasticsearch mongodb/db kuiper/files/files kuiper/files/raw backups/ci-original/
+          if [[ -f redis/dump.rdb ]]; then mv redis/dump.rdb backups/ci-original/; fi
+          mkdir -p elasticsearch mongodb/db kuiper/files/files kuiper/files/raw
+          sudo chown 1000:0 elasticsearch
+          docker compose up --wait --wait-timeout 240 mongodb es01 redis
+      - name: Restore and verify case status, indexed records, and evidence
+        run: |
+          bash scripts/kuiper-backup.sh restore ci-drill
+          docker compose up --wait --wait-timeout 240 flask celery
+          bash scripts/ingestion-smoke.sh verify
+      - name: Show service diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail=150
+      - name: Stop the disposable stack
+        if: always()
+        run: docker compose down

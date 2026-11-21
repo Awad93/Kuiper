@@ -188,9 +188,15 @@ def home():
 def is_authenticated():
     return 'last_visit' in session and 'user_id' in session
 
+@app.route('/healthz')
+def healthz():
+    return 'ok', 200
+
 @app.before_request
 def before_request():
     g.user = None
+    if request.endpoint == 'healthz':
+        return
     if request.full_path.startswith('/static') or request.full_path.startswith('/login') or request.full_path.startswith('/logout') or request.full_path.startswith('/error_api'):
         return
     # check if the api token correct

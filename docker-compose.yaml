@@ -37,11 +37,20 @@ services:
             #     nocopy: true
 
         depends_on:
-            # - "nfs"
-            - "mongodb"
-            - "es01"
-            - "redis"
-            - "celery"
+            mongodb:
+                condition: service_healthy
+            es01:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+
+        mem_limit: ${KUIPER_FLASK_MEMORY_LIMIT:-2g}
+        healthcheck:
+            test: ["CMD", "python", "-c", "import os, urllib2; urllib2.urlopen('http://127.0.0.1:' + os.getenv('FLASK_PORT', '5000').strip() + '/healthz', timeout=3).close()"]
+            interval: 15s
+            timeout: 5s
+            retries: 5
+            start_period: 30s
 
         
         networks:
@@ -75,10 +84,23 @@ services:
         restart: always
 
         depends_on:
-            # - nfs
-            - redis
-            - mongodb
-            - es01
+            redis:
+                condition: service_healthy
+            mongodb:
+                condition: service_healthy
+            es01:
+                condition: service_healthy
+
+        command: ["sh", "-c", "cron && exec python -m celery worker -A app.celery_app --loglevel=info -n kuiper@%h --concurrency=$${KUIPER_CELERY_CONCURRENCY:-2}"]
+        mem_limit: ${KUIPER_CELERY_MEMORY_LIMIT:-4g}
+        cpus: ${KUIPER_CELERY_CPUS:-2}
+        stop_grace_period: 2m
+        healthcheck:
+            test: ["CMD-SHELL", "python -m celery -A app.celery_app inspect --timeout=5 --destination=kuiper@$$(hostname) ping"]
+            interval: 30s
+            timeout: 15s
+            retries: 4
+            start_period: 45s
 
         volumes:
             - "./kuiper:/app/"
@@ -101,8 +123,8 @@ services:
             MONGODB_IP: mongodb
             ES_IP: es01
             FLASK_IP: flask
+            KUIPER_CELERY_CONCURRENCY: ${KUIPER_CELERY_CONCURRENCY:-2}
 
-            
         env_file:
             - ./.env
 
@@ -125,6 +147,13 @@ services:
         container_name: kuiper_mongodb
         restart: always
         
+        healthcheck:
+            test: ["CMD", "mongo", "--quiet", "--eval", "quit(db.adminCommand({ping: 1}).ok ? 0 : 1)"]
+            interval: 10s
+            timeout: 5s
+            retries: 6
+            start_period: 20s
+
         ports:
             - 27017:27017
         
@@ -157,12 +186,23 @@ services:
           - cluster.name=es-docker-cluster
           - discovery.seed_hosts=es01
           - cluster.initial_master_nodes=es01
-          - "ES_JAVA_OPTS=-Xms4g -Xmx4g"
+          - "ES_JAVA_OPTS=${KUIPER_ES_JAVA_OPTS:--Xms4g -Xmx4g}"
+          - path.repo=/mnt/kuiper-snapshots
           - FLASK_IP=flask
           - ES_IP=es01
         
+        restart: always
+        mem_limit: ${KUIPER_ES_MEMORY_LIMIT:-6g}
+        healthcheck:
+          test: ["CMD", "python3", "-c", "import json, urllib.request; status = json.load(urllib.request.urlopen('http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=3s', timeout=4)); raise SystemExit(status['timed_out'] or status['status'] == 'red')"]
+          interval: 15s
+          timeout: 5s
+          retries: 8
+          start_period: 60s
+
         volumes:
           - ./elasticsearch:/usr/share/elasticsearch/data:rw
+          - ${KUIPER_SNAPSHOT_DIR:-./backups/snapshots}:/mnt/kuiper-snapshots
         ports:
           - 9200:9200
 
@@ -192,8 +232,10 @@ services:
             - ./nginx/cert/:/nginx/cert/
 
         
+        restart: always
         depends_on:
-            - flask
+            flask:
+                condition: service_healthy
             
         env_file:
             - ./.env
@@ -215,6 +257,12 @@ services:
 
         image: dfirkuiper/kuiper_redis:${GIT_KUIPER_REDIS_VERSION}
         container_name: kuiper_redis
+        restart: always
+        healthcheck:
+            test: ["CMD-SHELL", "redis-cli ping | grep -qx PONG"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
         ports:
             - '6379:6379'
         volumes:
